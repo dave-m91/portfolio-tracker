@@ -9,7 +9,7 @@ from sqlmodel import select
 
 from .db import get_session
 from .fetcher import fetch_eur_pln_rate
-from .models import Asset, PriceHistory, Transaction, TransactionType
+from .models import Asset, AssetType, PriceHistory, Transaction, TransactionType
 
 _CENT = Decimal("0.01")
 
@@ -25,6 +25,7 @@ class PositionSummary:
 
     ticker: str
     name: str
+    asset_type: AssetType
     currency: str
     quantity: Decimal
     avg_buy_price: Decimal  # break-even per unit incl. fees (asset currency)
@@ -141,6 +142,7 @@ def get_portfolio_summary(
             PositionSummary(
                 ticker=asset.ticker,
                 name=asset.name,
+                asset_type=asset.asset_type,
                 currency=asset.currency,
                 quantity=net_qty,
                 avg_buy_price=_quantize(avg_buy),
