@@ -177,3 +177,47 @@ def test_quantity_is_buy_minus_sell(portfolio_db) -> None:
     assert position.value_pln == Decimal("6300.00")
     assert position.pnl_pln == Decimal("897.00")
     assert position.pnl_pct == Decimal("16.60")
+
+
+def test_refresh_prices_fetches_all_and_records_failures(
+    monkeypatch: pytest.MonkeyPatch, portfolio_db
+) -> None:
+    good_id = _add_asset("CDR.WA", "CD Projekt", AssetType.AKCJA, "PLN")
+    _add_asset("NOPE.XX", "Nieznany", AssetType.AKCJA, "PLN")
+
+    def fake_fetch(ticker: str):
+        if ticker == "CDR.WA":
+            return (date(2026, 10, 13), Decimal("200.00"))
+        return None
+
+    monkeypatch.setattr(portfolio, "fetch_yesterday_close", fake_fetch)
+
+    report = portfolio.refresh_prices()
+
+    assert report.fetched == ["CDR.WA"]
+    assert report.failed == ["NOPE.XX"]
+
+    session = portfolio.get_session()
+    prices = session.exec(select(PriceHistory).order_by(PriceHistory.id)).all()
+    session.close()
+    assert len(prices) == 1
+    assert prices[0].asset_id == good_id
+    assert prices[0].date == date(2026, 10, 13)
+    assert prices[0].close_price == Decimal("200.00")
+
+
+def test_refresh_prices_subset_ignores_unknown_tickers(
+    monkeypatch: pytest.MonkeyPatch, portfolio_db
+) -> None:
+    _add_asset("CDR.WA", "CD Projekt", AssetType.AKCJA, "PLN")
+
+    monkeypatch.setattr(
+        portfolio,
+        "fetch_yesterday_close",
+        lambda ticker: (date(2026, 10, 13), Decimal("200.00")),
+    )
+
+    report = portfolio.refresh_prices(tickers=["CDR.WA", "GHOST.WA"])
+
+    assert report.fetched == ["CDR.WA"]
+    assert report.failed == []

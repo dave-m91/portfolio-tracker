@@ -1,14 +1,14 @@
 """Portfolio operations: recording trades and computing positions."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date as date_type
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
 
-from sqlmodel import select
+from sqlmodel import Session, select
 
 from .db import get_session
-from .fetcher import fetch_eur_pln_rate
+from .fetcher import fetch_eur_pln_rate, fetch_yesterday_close
 from .models import Asset, AssetType, PriceHistory, Transaction, TransactionType
 
 _CENT = Decimal("0.01")
@@ -155,3 +155,52 @@ def get_portfolio_summary(
             )
         )
     return summaries
+
+
+@dataclass
+class PriceRefreshReport:
+    """Outcome of refreshing market prices for tracked assets."""
+
+    fetched: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+
+
+def refresh_prices(
+    tickers: Optional[list[str]] = None,
+    session: Optional[Session] = None,
+) -> PriceRefreshReport:
+    """Fetch and persist the latest close for assets in the ``Asset`` table.
+
+    With ``tickers=None`` (default) every unique ticker in ``Asset`` is
+    refreshed; otherwise only the given subset (unknown tickers are ignored).
+    Each successful quote becomes one ``PriceHistory`` row. Tickers that
+    ``yfinance`` cannot price are collected in ``failed`` rather than raising.
+    """
+    owns_session = session is None
+    session = session or get_session()
+    try:
+        if tickers is None:
+            targets = sorted({t for t in session.exec(select(Asset.ticker)).all()})
+        else:
+            targets = sorted(set(tickers))
+        report = PriceRefreshReport()
+        for ticker in targets:
+            asset = session.exec(
+                select(Asset).where(Asset.ticker == ticker)
+            ).first()
+            if asset is None:
+                continue
+            fetched = fetch_yesterday_close(ticker)
+            if fetched is None:
+                report.failed.append(ticker)
+                continue
+            price_date, close = fetched
+            session.add(
+                PriceHistory(asset_id=asset.id, date=price_date, close_price=close)
+            )
+            report.fetched.append(ticker)
+        session.commit()
+        return report
+    finally:
+        if owns_session:
+            session.close()

@@ -4,6 +4,7 @@ Run with: ``streamlit run src/portfolio/app.py``
 """
 
 import sys
+import tempfile
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -13,17 +14,26 @@ import plotly.express as px
 import streamlit as st
 from sqlmodel import select
 
-# When Streamlit runs this file directly, the script's own directory lands first
-# on ``sys.path``; because it also contains a ``portfolio.py`` module, that would
-# shadow the ``portfolio`` package and break the absolute imports below. Put
-# ``src/`` at the front of ``sys.path`` (deduplicating) so imports resolve to the
-# installed package.
+# When Streamlit runs this file directly, the script's own directory
+# (``src/portfolio``) lands on ``sys.path`` and, because it also contains a
+# ``portfolio.py`` module, would shadow the ``portfolio`` package. Drop the
+# script directory and put ``src/`` at the front so imports resolve to the
+# installed package exactly once (no duplicate module identity -> no
+# "Table already defined").
 _SRC_DIR = str(Path(__file__).resolve().parent.parent)
-sys.path = [_SRC_DIR] + [p for p in sys.path if p != _SRC_DIR]
+_PKG_DIR = str(Path(__file__).resolve().parent)
+sys.path = [_SRC_DIR] + [p for p in sys.path if p not in (_SRC_DIR, _PKG_DIR)]
 
 from portfolio.db import get_session, init_db
 from portfolio.models import Asset, TransactionType
-from portfolio.portfolio import PositionSummary, get_portfolio_summary, record_transaction
+from portfolio.portfolio import (
+    PositionSummary,
+    get_portfolio_summary,
+    record_transaction,
+    refresh_prices,
+)
+from portfolio.xtb_parser import XTBStatementError, import_cash_operations
+from portfolio.rebalancer import calculate_monthly_plan, current_month_has_transactions
 
 st.set_page_config(page_title="Portfolio Tracker", page_icon="📈", layout="wide")
 
@@ -156,9 +166,154 @@ def _render_transaction_form() -> None:
         st.rerun()
 
 
+def _upload_id(uploaded) -> str:
+    """Stable identity for an uploaded file (avoids re-import on rerun)."""
+    return getattr(uploaded, "file_id", None) or f"{uploaded.name}:{uploaded.size}"
+
+
+def _render_xtb_uploader() -> None:
+    st.sidebar.header("Import wyciągu XTB")
+    uploaded = st.sidebar.file_uploader(
+        "Wgraj raport XTB (.xlsx)", type=["xlsx"], key="xtb_uploader"
+    )
+
+    if uploaded is None:
+        st.session_state.pop("xtb_processed_id", None)
+        st.session_state.pop("xtb_import_msg", None)
+        return
+
+    upload_id = _upload_id(uploaded)
+    if st.session_state.get("xtb_processed_id") == upload_id:
+        message = st.session_state.get("xtb_import_msg")
+        if message:
+            st.sidebar.success(message)
+        return
+
+    suffix = Path(uploaded.name).suffix or ".xlsx"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+        handle.write(uploaded.getbuffer())
+        temp_path = handle.name
+
+    try:
+        try:
+            report = import_cash_operations(temp_path)
+        except XTBStatementError as exc:
+            st.sidebar.error(str(exc))
+            st.session_state["xtb_processed_id"] = upload_id
+            st.session_state.pop("xtb_import_msg", None)
+            return
+        except Exception as exc:  # corrupt / non-xlsx file
+            st.sidebar.error(f"Nie udało się wczytać pliku: {exc}")
+            st.session_state["xtb_processed_id"] = upload_id
+            st.session_state.pop("xtb_import_msg", None)
+            return
+        refresh_report = refresh_prices(report.assets_created)
+    finally:
+        Path(temp_path).unlink(missing_ok=True)
+
+    parts = [
+        f"Zaimportowano {report.transactions_added} transakcji",
+        f"nowe aktywa: {len(report.assets_created)}",
+        f"pominięte wiersze: {len(report.skipped)}",
+    ]
+    if refresh_report.fetched:
+        parts.append(f"pobrano kursy: {len(refresh_report.fetched)}")
+    if refresh_report.failed:
+        parts.append(f"błędy kursów: {', '.join(refresh_report.failed)}")
+
+    st.session_state["xtb_processed_id"] = upload_id
+    st.session_state["xtb_import_msg"] = "; ".join(parts) + "."
+    st.rerun()
+
+
+def _render_dca_tab() -> None:
+    try:
+        plan = calculate_monthly_plan()
+    except Exception as exc:  # e.g. NBP rate fetch failed
+        st.error(f"Nie udało się wyliczyć planu: {exc}")
+        return
+
+    if current_month_has_transactions():
+        st.info(
+            "Transza za bieżący miesiąc zrealizowana. "
+            "Poniżej symulacja podziału na kolejny miesiąc."
+        )
+
+    comparison_rows = []
+    for item in plan["comparison"]:
+        comparison_rows.append(
+            {"Ticker": item.ticker, "Typ": "Obecny", "Udział (%)": float(item.current_weight)}
+        )
+        comparison_rows.append(
+            {"Ticker": item.ticker, "Typ": "Cel", "Udział (%)": float(item.target_weight)}
+        )
+    fig = px.bar(
+        pd.DataFrame(comparison_rows),
+        x="Ticker",
+        y="Udział (%)",
+        color="Typ",
+        barmode="group",
+        title="Obecny udział w portfelu vs cel",
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    st.subheader("Rekomendacje zakupów")
+    buy_rows = [
+        {
+            "Ticker": b.ticker,
+            "Nazwa": b.name,
+            "Kwota (PLN)": float(b.amount_pln),
+            "Szac. sztuk": float(b.estimated_units),
+            "Waga obecna (%)": float(b.current_weight),
+            "Waga docelowa (%)": float(b.target_weight),
+        }
+        for b in plan["buys"]
+    ]
+    st.dataframe(
+        pd.DataFrame(buy_rows),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Ticker": st.column_config.TextColumn("Ticker"),
+            "Nazwa": st.column_config.TextColumn("Nazwa"),
+            "Kwota (PLN)": st.column_config.NumberColumn("Kwota (PLN)", format="%.2f PLN"),
+            "Szac. sztuk": st.column_config.NumberColumn("Szac. sztuk", format="%.4f"),
+            "Waga obecna (%)": st.column_config.NumberColumn("Waga obecna (%)", format="%.2f%%"),
+            "Waga docelowa (%)": st.column_config.NumberColumn("Waga docelowa (%)", format="%.2f%%"),
+        },
+    )
+
+    st.subheader("Rezerwa — oczekuje na rotację")
+    reserve_rows = [
+        {
+            "Ticker": r.ticker,
+            "Nazwa": r.name,
+            "Waga docelowa (%)": float(r.target_weight),
+            "Waga obecna (%)": float(r.current_weight),
+            "Odchylenie (pkt %)": float(r.gap),
+        }
+        for r in plan["reserve"]
+    ]
+    st.dataframe(
+        pd.DataFrame(reserve_rows),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Ticker": st.column_config.TextColumn("Ticker"),
+            "Nazwa": st.column_config.TextColumn("Nazwa"),
+            "Waga docelowa (%)": st.column_config.NumberColumn("Waga docelowa (%)", format="%.2f%%"),
+            "Waga obecna (%)": st.column_config.NumberColumn("Waga obecna (%)", format="%.2f%%"),
+            "Odchylenie (pkt %)": st.column_config.NumberColumn("Odchylenie (pkt %)", format="%.2f"),
+        },
+    )
+
+
 def main() -> None:
     init_db()
     st.title("📈 Portfolio Tracker")
+
+    _render_xtb_uploader()
+    _render_transaction_form()
 
     try:
         summary = get_portfolio_summary()
@@ -168,17 +323,18 @@ def main() -> None:
 
     if not summary:
         st.info(
-            "Brak pozycji. Uruchom `python -m portfolio.main`, aby zainicjalizować "
-            "bazę, lub dodaj transakcję w panelu bocznym."
+            "Brak pozycji. Zaimportuj wyciąg XTB lub dodaj transakcję w panelu bocznym."
         )
-        _render_transaction_form()
         return
 
     df = _summary_frame(summary)
-    _render_metrics(summary)
-    _render_charts(df)
-    _render_table(df)
-    _render_transaction_form()
+    portfolio_tab, dca_tab = st.tabs(["Portfel", "Plan Inwestycyjny DCA (1000 PLN)"])
+    with portfolio_tab:
+        _render_metrics(summary)
+        _render_charts(df)
+        _render_table(df)
+    with dca_tab:
+        _render_dca_tab()
 
 
 if __name__ == "__main__":
